@@ -40,7 +40,7 @@ This API allows you to create temporary TCP proxies using `socat`. It provides e
 4. Run the Flask app:
 
     ```bash
-    python app.py
+    python server.py
     ```
 
 The application will run on `http://0.0.0.0:3003`.
