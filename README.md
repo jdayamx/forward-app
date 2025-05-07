@@ -146,7 +146,3 @@ GET /list
 - `local_port`: The internal port to which the traffic is forwarded.
 - `public_port`: The open port for external connections.
 - After restarting the Flask app, previously created forwarding rules will be lost, and you will need to recreate them.
-
-## License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.

@@ -1,9 +1,18 @@
 from flask import Flask, request, jsonify
 import subprocess
+import socket
 
 app = Flask(__name__)
 
 socat_processes = {}
+
+def find_free_port(start_port):
+    port = start_port + 1
+    while True:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            if s.connect_ex(('0.0.0.0', port)) != 0:
+                return port
+        port += 1
 
 @app.route('/open', methods=['GET'])
 def open_port():
@@ -12,9 +21,10 @@ def open_port():
     if not port:
         return jsonify({"status": "error", "message": "Port can not be empty"}), 400
     if port not in socat_processes:
-        SOCAT_CMD = ["socat", f"TCP-LISTEN:{port + 1},reuseaddr,fork", f"TCP:0.0.0.0:{port}"]
+        public_port = find_free_port(port)
+        SOCAT_CMD = ["socat", f"TCP-LISTEN:{public_port},reuseaddr,fork", f"TCP:0.0.0.0:{port}"]
         socat_processes[port] = subprocess.Popen(SOCAT_CMD)
-        return jsonify({"status": "success", "local_port": port, "public_port": port + 1}), 200
+        return jsonify({"status": "success", "local_port": port, "public_port": public_port}), 200
     return jsonify({"status": "error", "message": f"Port {port} already forwarded to {port + 1}"}), 400
 
 @app.route('/close', methods=['GET'])
