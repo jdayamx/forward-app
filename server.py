@@ -14,9 +14,44 @@ def find_free_port(start_port):
                 return port
         port += 1
 
+def is_port_alive(port):
+    """Перевірка чи порт LISTEN."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        return s.connect_ex(("0.0.0.0", port)) == 0
+    
+def cleanup_dead_forwards():
+    """Перевіряє всі socat процеси, і якщо якийсь не відповідає — прибиває."""
+    global socat_processes
+
+    ports_to_delete = []
+
+    for local_port, proc in socat_processes.items():
+        public_port = local_port + 1
+
+        # 1) Перевірка чи процес живий
+        if proc.poll() is not None:
+            ports_to_delete.append(local_port)
+            continue
+
+        # 2) Перевірка чи порт реально слухає
+        if not is_port_alive(public_port):
+            try:
+                proc.terminate()
+            except:
+                pass
+            ports_to_delete.append(local_port)
+
+    # Прибираємо мертві з dict
+    for p in ports_to_delete:
+        del socat_processes[p]
+
 @app.route('/open', methods=['GET'])
 def open_port():
     global socat_processes
+
+    # 🔥 ПЕРЕД open — ПОВНА ПЕРЕВІРКА ВСІХ ПРОЦЕСІВ
+    cleanup_dead_forwards()
+
     port = request.args.get('port', type=int)
     if not port:
         return jsonify({"status": "error", "message": "Port can not be empty"}), 400
