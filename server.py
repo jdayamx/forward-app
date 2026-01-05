@@ -1,174 +1,252 @@
 from flask import Flask, request, jsonify
 import subprocess
 import socket
+import time
+import threading
+import os
+import signal
+from datetime import datetime, timedelta
+import uuid
 
 app = Flask(__name__)
 
-socat_processes = {}
+TTL_SECONDS = 30 * 60
+CLEAN_INTERVAL = 10
 
-def find_free_port(start_port):
-    port = start_port + 1
+forwards = {}
+
+
+def find_free_port():
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("0.0.0.0", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def kill_process(proc: subprocess.Popen):
+    try:
+        proc.terminate()
+        proc.wait(timeout=3)
+    except:
+        try:
+            os.kill(proc.pid, signal.SIGKILL)
+        except:
+            pass
+
+
+def cleaner_loop():
     while True:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            if s.connect_ex(('0.0.0.0', port)) != 0:
-                return port
-        port += 1
+        now = datetime.utcnow()
+        to_delete = []
 
-def is_port_alive(port):
-    """Перевірка чи порт LISTEN."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        return s.connect_ex(("0.0.0.0", port)) == 0
-    
-def cleanup_dead_forwards():
-    """Перевіряє всі socat процеси, і якщо якийсь не відповідає — прибиває."""
-    global socat_processes
+        for fid, data in forwards.items():
+            proc = data["process"]
+            started = data["started_at"]
 
-    ports_to_delete = []
+            # 1) процес вже мертвий
+            if proc.poll() is not None:
+                to_delete.append(fid)
+                continue
 
-    for local_port, proc in socat_processes.items():
-        public_port = local_port + 1
+            # 2) TTL
+            if (now - started).total_seconds() >= TTL_SECONDS:
+                kill_process(proc)
+                to_delete.append(fid)
 
-        # 1) Перевірка чи процес живий
-        if proc.poll() is not None:
-            ports_to_delete.append(local_port)
-            continue
+        for fid in to_delete:
+            forwards.pop(fid, None)
 
-        # 2) Перевірка чи порт реально слухає
-        if not is_port_alive(public_port):
-            try:
-                proc.terminate()
-            except:
-                pass
-            ports_to_delete.append(local_port)
+        time.sleep(CLEAN_INTERVAL)
 
-    # Прибираємо мертві з dict
-    for p in ports_to_delete:
-        del socat_processes[p]
 
-@app.route('/open', methods=['GET'])
-def open_port():
-    global socat_processes
+@app.route("/open", methods=["POST"])
+def open_forward():
+    local_port = request.json.get("port")
+    if not local_port:
+        return jsonify({"error": "port required"}), 400
 
-    # 🔥 ПЕРЕД open — ПОВНА ПЕРЕВІРКА ВСІХ ПРОЦЕСІВ
-    cleanup_dead_forwards()
+    public_port = find_free_port()
+    fid = str(uuid.uuid4())
 
-    port = request.args.get('port', type=int)
-    if not port:
-        return jsonify({"status": "error", "message": "Port can not be empty"}), 400
-    if port not in socat_processes:
-        public_port = find_free_port(port)
-        SOCAT_CMD = ["socat", f"TCP-LISTEN:{public_port},reuseaddr,fork", f"TCP:0.0.0.0:{port}"]
-        socat_processes[port] = subprocess.Popen(SOCAT_CMD)
-        return jsonify({"status": "success", "local_port": port, "public_port": public_port}), 200
-    return jsonify({"status": "error", "message": f"Port {port} already forwarded to {port + 1}"}), 400
+    cmd = [
+        "socat",
+        f"TCP-LISTEN:{public_port},reuseaddr,fork",
+        f"TCP:127.0.0.1:{local_port}"
+    ]
 
-@app.route('/close', methods=['GET'])
-def close_port():
-    global socat_processes
-    port = request.args.get('port', type=int)
-    if not port:
-        return jsonify({"status": "error", "message": "Port can not be empty"}), 400
-    if port in socat_processes:
-        socat_processes[port].terminate()
-        del socat_processes[port]
-        return jsonify({"status": "success", "message": f"Forward {port} to {port + 1} is closed"}), 200
-    return jsonify({"status": "error", "message": "Port already closed"}), 400
+    proc = subprocess.Popen(cmd)
 
-@app.route('/list', methods=['GET'])
-def list_ports():
-    global socat_processes
-    return jsonify([
-        {
-            "local_port": port,
-            "public_port": port + 1,
-            "pid": proc.pid
-        }
-        for port, proc in socat_processes.items()
-    ]), 200
+    forwards[fid] = {
+        "local_port": local_port,
+        "public_port": public_port,
+        "process": proc,
+        "started_at": datetime.utcnow()
+    }
 
-@app.route('/')
+    return jsonify({
+        "id": fid,
+        "local_port": local_port,
+        "public_port": public_port,
+        "ttl_minutes": 30
+    })
+
+
+@app.route("/close", methods=["POST"])
+def close_forward():
+    fid = request.json.get("id")
+    if fid not in forwards:
+        return jsonify({"error": "not found"}), 404
+
+    kill_process(forwards[fid]["process"])
+    forwards.pop(fid)
+
+    return jsonify({"status": "closed"})
+
+
+@app.route("/list", methods=["GET"])
+def list_forwards():
+    now = datetime.utcnow()
+    result = []
+
+    for fid, data in forwards.items():
+        result.append({
+            "id": fid,
+            "local_port": data["local_port"],
+            "public_port": data["public_port"],
+            "pid": data["process"].pid,
+            "uptime_sec": int((now - data["started_at"]).total_seconds())
+        })
+
+    return jsonify(result)
+
+@app.route("/")
 def index():
     return """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Socat Forwarding API</title>
-        <style>
-            body { font-family: sans-serif; padding: 2rem; background: #fdfdfd; color: #222; }
-            h1 { color: #444; }
-            h2 { margin-top: 2rem; color: #555; }
-            pre { background: #f4f4f4; padding: 1rem; border-left: 3px solid #ccc; overflow-x: auto; }
-            code { background: #eee; padding: 2px 4px; border-radius: 4px; }
-            table { border-collapse: collapse; width: 100%; margin-top: 1rem; }
-            th, td { border: 1px solid #ccc; padding: 0.5rem 1rem; text-align: left; }
-            th { background: #eee; }
-            tr:nth-child(even) { background: #f9f9f9; }
-        </style>
-    </head>
-    <body>
-        <h1>Socat Forwarding API</h1>
-        <p>This API allows you to create temporary TCP proxies using <code>socat</code>.</p>
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Socat Port Forwarding API</title>
+    <style>
+        body {
+            font-family: system-ui, sans-serif;
+            padding: 2rem;
+            background: #fdfdfd;
+            color: #222;
+        }
+        h1 { color: #333; }
+        h2 { margin-top: 2rem; color: #444; }
+        pre {
+            background: #f4f4f4;
+            padding: 1rem;
+            border-left: 4px solid #ccc;
+            overflow-x: auto;
+        }
+        code {
+            background: #eee;
+            padding: 2px 6px;
+            border-radius: 4px;
+        }
+        table {
+            border-collapse: collapse;
+            width: 100%;
+            margin-top: 1rem;
+        }
+        th, td {
+            border: 1px solid #ccc;
+            padding: 0.6rem 1rem;
+            text-align: left;
+        }
+        th {
+            background: #eee;
+        }
+        tr:nth-child(even) {
+            background: #f9f9f9;
+        }
+        .note {
+            background: #fff8e1;
+            padding: 1rem;
+            border-left: 4px solid #ffcc00;
+            margin-top: 1rem;
+        }
+    </style>
+</head>
+<body>
 
-        <h2>🚀 <code>GET /open?port=PORT</code></h2>
-        <p>Creates a proxy from <code>PORT + 1 → PORT</code>.</p>
-        <h3>Example</h3>
-        <pre>GET /open?port=8080</pre>
-        <h3>Response</h3>
-        <pre>{
-  "status": "success",
+<h1>🔀 Socat Port Forwarding API</h1>
+
+<p>
+Цей сервіс дозволяє тимчасово відкривати TCP-форварди за допомогою
+<code>socat</code>.
+Публічний порт обирається автоматично, а кожен форвард має обмежений час життя.
+</p>
+
+<div class="note">
+<b>⏱ TTL:</b> кожен форвард автоматично завершується через <b>30 хвилин</b>,
+навіть якщо процес ще живий.
+</div>
+
+<h2>🚀 POST <code>/open</code></h2>
+<p>
+Створює TCP-форвард з випадкового вільного <b>public_port</b> → <b>local_port</b>.
+</p>
+
+<h3>Request</h3>
+<pre>{
+  "port": 8080
+}</pre>
+
+<h3>Response</h3>
+<pre>{
+  "id": "c2c44b4e-0c8a-4c7c-9b33-5d2f88c3b7fa",
   "local_port": 8080,
-  "public_port": 8081
-}</pre>
-        <h3>If the port is already open</h3>
-        <pre>{
-  "status": "error",
-  "message": "Port 8080 already forwarded to 8081"
+  "public_port": 49152,
+  "ttl_minutes": 30
 }</pre>
 
-        <h2>🛑 <code>GET /close?port=PORT</code></h2>
-        <p>Terminates the proxy from <code>PORT + 1 → PORT</code>.</p>
-        <h3>Example</h3>
-        <pre>GET /close?port=8080</pre>
-        <h3>Response</h3>
-        <pre>{
-  "status": "success",
-  "message": "Forward 8080 to 8081 is closed"
-}</pre>
-        <h3>If the forwarding is already closed</h3>
-        <pre>{
-  "status": "error",
-  "message": "Port already closed"
+<h2>🛑 POST <code>/close</code></h2>
+<p>
+Примусово завершує форвард за його <code>id</code>.
+</p>
+
+<h3>Request</h3>
+<pre>{
+  "id": "c2c44b4e-0c8a-4c7c-9b33-5d2f88c3b7fa"
 }</pre>
 
-        <h2>📋 <code>GET /list</code></h2>
-        <p>Displays all active proxy connections.</p>
-        <h3>Example</h3>
-        <pre>GET /list</pre>
-        <h3>Response</h3>
-        <pre>[
+<h3>Response</h3>
+<pre>{
+  "status": "closed"
+}</pre>
+
+<h2>📋 GET <code>/list</code></h2>
+<p>
+Повертає список усіх активних форвардів.
+</p>
+
+<h3>Response</h3>
+<pre>[
   {
+    "id": "c2c44b4e-0c8a-4c7c-9b33-5d2f88c3b7fa",
     "local_port": 8080,
-    "public_port": 8081,
-    "pid": 12345
-  },
-  {
-    "local_port": 3000,
-    "public_port": 3001,
-    "pid": 12346
+    "public_port": 49152,
+    "pid": 12345,
+    "uptime_sec": 412
   }
 ]</pre>
 
-        <h2>📌 Notes</h2>
-        <ul>
-            <li>All requests are <code>GET</code> requests.</li>
-            <li><code>local_port</code> is the port where traffic is forwarded to.</li>
-            <li><code>public_port</code> is the open port for external connections.</li>
-            <li>After restarting the Flask app, forwarding needs to be recreated.</li>
-        </ul>
-    </body>
-    </html>
-    """
+<h2>📌 Notes</h2>
+<ul>
+    <li><b>public_port</b> обирається автоматично ОС.</li>
+    <li>Форвард існує не більше <b>30 хвилин</b>.</li>
+    <li>Після завершення TTL процес <code>socat</code> жорстко прибивається.</li>
+    <li>Після рестарту Flask-сервісу всі форварди втрачаються.</li>
+</ul>
 
+</body>
+</html>
+"""
 
-if __name__ == '__main__':
+if __name__ == "__main__":
+    threading.Thread(target=cleaner_loop, daemon=True).start()
     app.run(host="0.0.0.0", port=3003)
